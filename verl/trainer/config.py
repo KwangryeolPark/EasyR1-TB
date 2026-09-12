@@ -122,6 +122,12 @@ class TrainerConfig:
     """validate only, skip training"""
     val_generations_to_log: int = 0
     """number of generations to log for validation"""
+    best_metric: str = "reward_score"
+    """metric used to retain the best checkpoint: ``reward_score`` or ``accuracy``"""
+    epoch_end_validation: bool = False
+    """run validation whenever a complete train dataloader epoch is consumed"""
+    epoch_end_save: bool = False
+    """save a checkpoint whenever a complete train dataloader epoch is consumed"""
     save_freq: int = -1
     """save frequency, -1 means no saving"""
     save_limit: int = -1

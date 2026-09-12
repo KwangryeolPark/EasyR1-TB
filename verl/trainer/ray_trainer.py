@@ -180,9 +180,13 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.steps_per_epoch = len(train_dataloader)
 
         self.val_reward_score = 0.0
+        self.val_accuracy_score = 0.0
         self.best_val_reward_score = -1.0
+        self.best_val_accuracy_score = -1.0
+        self.best_validation_score = -1.0
         self.best_global_step = None
 
         self.hybrid_engine = config.worker.hybrid_engine
@@ -247,6 +251,9 @@ class RayPPOTrainer:
         config.worker.critic.optim.training_steps = self.training_steps
         print(f"Total training steps: {self.training_steps}")
 
+    def _is_epoch_end_step(self) -> bool:
+        return self.steps_per_epoch > 0 and self.global_step % self.steps_per_epoch == 0
+
     def init_workers(self) -> None:
         """Init resource pool and worker group"""
         self.resource_pool_manager.create_resource_pool()
@@ -309,6 +316,20 @@ class RayPPOTrainer:
         # path: {save_checkpoint_path}/global_step_{global_step}/{actor,critic}
         if self.val_reward_score > self.best_val_reward_score:
             self.best_val_reward_score = self.val_reward_score
+        if self.val_accuracy_score > self.best_val_accuracy_score:
+            self.best_val_accuracy_score = self.val_accuracy_score
+
+        if self.config.trainer.best_metric == "accuracy":
+            selected_score = self.val_accuracy_score
+        elif self.config.trainer.best_metric == "reward_score":
+            selected_score = self.val_reward_score
+        else:
+            raise ValueError(
+                f"Unsupported trainer.best_metric={self.config.trainer.best_metric!r}; "
+                "choose 'reward_score' or 'accuracy'."
+            )
+        if selected_score > self.best_validation_score:
+            self.best_validation_score = selected_score
             self.best_global_step = self.global_step
 
         remove_obsolete_ckpt(
@@ -332,7 +353,12 @@ class RayPPOTrainer:
         checkpointer_tracker_info = {
             "best_global_step": self.best_global_step,
             "best_val_reward_score": round(self.best_val_reward_score, 4),
+            "best_val_accuracy": round(self.best_val_accuracy_score, 4),
+            "best_validation_metric": self.config.trainer.best_metric,
+            "best_validation_score": round(self.best_validation_score, 4),
             "last_global_step": self.global_step,
+            "final_val_reward_score": round(self.val_reward_score, 4),
+            "final_val_accuracy": round(self.val_accuracy_score, 4),
             "last_actor_path": os.path.abspath(actor_path),
         }
         checkpointer_tracker_path = os.path.join(self.config.trainer.save_checkpoint_path, CHECKPOINT_TRACKER)
@@ -346,6 +372,10 @@ class RayPPOTrainer:
             load_checkpoint_path, tracker_info = find_latest_ckpt(self.config.trainer.save_checkpoint_path)
             if tracker_info is not None:
                 self.best_val_reward_score = tracker_info.get("best_val_reward_score", 0.0)
+                self.best_val_accuracy_score = tracker_info.get("best_val_accuracy", 0.0)
+                self.best_validation_score = tracker_info.get(
+                    "best_validation_score", self.best_val_reward_score
+                )
                 self.best_global_step = tracker_info.get("best_global_step", 0)
         else:
             load_checkpoint_path = None
@@ -441,7 +471,9 @@ class RayPPOTrainer:
         self.actor_rollout_ref_wg.release_rollout_engine()
         self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
         self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
-        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+        reduced_reward_metrics = reduce_metrics(reward_metrics_lst)
+        self.val_accuracy_score = float(reduced_reward_metrics.get("accuracy", 0.0))
+        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduced_reward_metrics.items()}
         val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
         print("Finish validation.")
         return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
@@ -664,17 +696,21 @@ class RayPPOTrainer:
                     metrics.update(actor_metrics)
 
                 # validate
-                if (
+                periodic_validation = (
                     self.val_reward_fn is not None
                     and self.config.trainer.val_freq > 0
                     and self.global_step % self.config.trainer.val_freq == 0
-                ):
+                )
+                epoch_end_validation = self.config.trainer.epoch_end_validation and self._is_epoch_end_step()
+                if periodic_validation or epoch_end_validation:
                     with timer("validation", timing_raw):
                         val_metrics = self._validate()
 
                     metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
+                periodic_save = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
+                epoch_end_save = self.config.trainer.epoch_end_save and self._is_epoch_end_step()
+                if periodic_save or epoch_end_save:
                     with timer("save_checkpoint", timing_raw):
                         self._save_checkpoint()
 
@@ -689,15 +725,15 @@ class RayPPOTrainer:
 
         # perform validation after training
         if self.val_reward_fn is not None:
-            if (
-                val_metrics is None
-                or self.config.trainer.val_freq <= 0
-                or self.global_step % self.config.trainer.val_freq != 0
-            ):
+            periodic_validation = self.config.trainer.val_freq > 0 and self.global_step % self.config.trainer.val_freq == 0
+            epoch_end_validation = self.config.trainer.epoch_end_validation and self._is_epoch_end_step()
+            if val_metrics is None or not (periodic_validation or epoch_end_validation):
                 val_metrics = self._validate()
                 self.logger.log(data=val_metrics, step=self.global_step)
 
             print(f"Final validation metrics:\n{convert_dict_to_str(unflatten_dict(val_metrics))}")
 
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
+        periodic_save = self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0
+        epoch_end_save = self.config.trainer.epoch_end_save and self._is_epoch_end_step()
+        if not (periodic_save or epoch_end_save):
             self._save_checkpoint()
